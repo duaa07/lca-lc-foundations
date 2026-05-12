@@ -19,9 +19,7 @@ nltk.download("stopwords", quiet=True)
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
  
- 
-# ── Extraction ────────────────────────────────────────────────────────────────
- 
+  
 def extract_pdf(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     full_text = ""
@@ -65,10 +63,7 @@ def extract_docx(file_bytes):
             full_text.append(text)
             
     return "\n".join(full_text), headings
- 
- 
-# ── Feature 1: Summarization ──────────────────────────────────────────────────
- 
+  
 def summarize(full_text):
     parser = PlaintextParser.from_string(full_text, Tokenizer("english"))
     summarizer = TextRankSummarizer()
@@ -77,9 +72,7 @@ def summarize(full_text):
     result = summarizer(parser.document, count)
     return " ".join(str(s) for s in result), total, count
  
- 
-# ── Feature 2: Heading Extraction ─────────────────────────────────────────────
- 
+  
 def extract_headings_pdf(pages_data):
     from collections import Counter
     all_sizes = []
@@ -113,10 +106,7 @@ def extract_headings_pdf(pages_data):
                     seen.add(text)
  
     return headings
- 
- 
-# ── Feature 3: Semantic Search ────────────────────────────────────────────────
- 
+  
 @st.cache_data
 def get_embeddings(sent_texts):
     return load_model().encode(list(sent_texts))
@@ -131,7 +121,7 @@ def search(query, sentences, embeddings, top_k):
             for i, idx in enumerate(top_indices)]
  
  
-# ── UI ────────────────────────────────────────────────────────────────────────
+# UI 
  
 st.title("Document Analyzer")
  
