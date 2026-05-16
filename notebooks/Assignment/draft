@@ -1,0 +1,268 @@
+import streamlit as st          # Web UI framework — creates the app interface
+import fitz                     # PyMuPDF — reads and parses PDF files
+import io                       # Handles in-memory byte streams (for docx loading)
+import re                       # Regular expressions — used for splitting sentences
+import numpy as np              # Numerical operations — used for sorting similarity scores
+from docx import Document       # python-docx — reads Word (.docx) files
+from sumy.parsers.plaintext import PlaintextParser    # Sumy — parses plain text for summarization
+from sumy.nlp.tokenizers import Tokenizer             # Sumy — tokenizes text into sentences/words
+from sumy.summarizers.text_rank import TextRankSummarizer  # Sumy — graph-based extractive summarizer
+from sentence_transformers import SentenceTransformer  # Converts sentences to vector embeddings
+from sklearn.metrics.pairwise import cosine_similarity # Measures similarity between two vectors
+import nltk                     # Natural language toolkit — required by Sumy under the hood
+
+# Download required NLTK data files (punkt = sentence tokenizer, stopwords = common words to ignore)
+# quiet=True suppresses output if already downloaded
+nltk.download("punkt", quiet=True)
+nltk.download("stopwords", quiet=True)
+
+# ── MODEL LOADING ──────────────────────────────────────────────────────────────
+
+@st.cache_resource
+# @st.cache_resource means Streamlit loads this model ONCE and reuses it across
+# all users/sessions — avoids re-downloading the model on every interaction
+def load_nlp_model():
+    # Loads a lightweight but capable sentence embedding model (~80MB)
+    # "all-MiniLM-L6-v2" converts any sentence into a 384-dimensional vector
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+# ── PDF TEXT EXTRACTION ────────────────────────────────────────────────────────
+
+def get_text_from_pdf(pdf_bytes):
+    # Opens the PDF from raw bytes (not a file path) using fitz/PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    combined_text = ""   # Will hold all text from all pages concatenated
+    sentence_list = []   # List of (sentence, page_number) tuples for search
+    structural_data = [] # Raw block data per page — used later for heading detection
+
+    for page_num, page in enumerate(doc, start=1):
+        page_text = page.get_text()               # Extract plain text from this page
+        combined_text += page_text + "\n"         # Append to full document text
+
+        blocks = page.get_text("dict")["blocks"]  # Get structured block data (font sizes, positions)
+        structural_data.append({"page": page_num, "blocks": blocks})  # Store for heading detection
+
+        # Split page text into sentences using punctuation boundaries (.  !  ?)
+        # (?<=[.!?]) is a lookbehind — splits AFTER punctuation, not before
+        raw_sentences = re.split(r"(?<=[.!?])\s+", page_text.strip())
+
+        for s in raw_sentences:
+            # Filter out very short fragments (less than 5 words) — not useful for search
+            if len(s.split()) > 4:
+                sentence_list.append((s, page_num))  # Store sentence with its page number
+
+    return combined_text, structural_data, sentence_list
+
+# ── DOCX TEXT EXTRACTION ───────────────────────────────────────────────────────
+
+def get_text_from_docx(docx_bytes):
+    # Wrap raw bytes in BytesIO so python-docx can read it like a file
+    doc = Document(io.BytesIO(docx_bytes))
+    combined_text = ""  # Full document text
+    sentence_list = []  # (sentence, None) — docx has no page numbers
+    heading_info = []   # List of detected headings with their levels
+
+    for para in doc.paragraphs:
+        clean_para = para.text.strip()
+        if not clean_para:
+            continue  # Skip empty paragraphs
+
+        combined_text += clean_para + "\n"
+
+        # Check if this paragraph is a heading (Word uses styles like "Heading 1", "Heading 2")
+        if para.style and hasattr(para.style, 'name') and para.style.name and para.style.name.startswith("Heading"):
+            style_name = para.style.name
+            level_match = re.search(r"\d+", style_name)           # Extract heading level number
+            level = int(level_match.group()) if level_match else 1 # Default to H1 if not found
+            heading_info.append({"level": level, "text": clean_para})
+        else:
+            # Regular paragraph — split into sentences for search
+            raw_sentences = re.split(r"(?<=[.!?])\s+", clean_para)
+            for s in raw_sentences:
+                if len(s.split()) > 4:
+                    sentence_list.append((s, None))  # No page number available in docx
+
+    return combined_text, heading_info, sentence_list
+
+# ── SUMMARIZATION ──────────────────────────────────────────────────────────────
+
+def run_summarizer(text_content):
+    # Parse the full text into a Sumy document object using English tokenization
+    parser = PlaintextParser.from_string(text_content, Tokenizer("english"))
+
+    # TextRank is a graph-based algorithm — sentences that are similar to many
+    # other sentences get ranked higher (like Google PageRank but for sentences)
+    summarizer = TextRankSummarizer()
+
+    all_sentences = list(parser.document.sentences)
+    total_count = len(all_sentences)
+
+    # Extract 15% of sentences — balances brevity vs coverage
+    num_to_extract = int(total_count * 0.15)
+    if num_to_extract < 5:
+        num_to_extract = 5  # Always extract at least 5 sentences for very short docs
+
+    # Run the summarizer — returns the top-ranked sentences in document order
+    summary_result = summarizer(parser.document, num_to_extract)
+
+    # Join the selected sentences into a single readable string
+    final_string = ""
+    for sentence in summary_result:
+        final_string += str(sentence) + " "
+
+    return final_string, total_count, num_to_extract
+
+# ── PDF HEADING DETECTION ──────────────────────────────────────────────────────
+
+def find_pdf_headings(doc_blocks):
+    # PDFs have no semantic heading tags — we detect headings by font size
+    found_headings = []
+    already_seen = set()  # Prevents duplicate headings (same text on multiple pages)
+
+    for item in doc_blocks:
+        page_no = item["page"]
+        for block in item["blocks"]:
+            if "lines" not in block:
+                continue  # Skip image blocks or non-text blocks
+
+            for line in block["lines"]:
+                spans = line.get("spans", [])
+                # Merge all text spans in this line into one string
+                text_line = " ".join(s["text"] for s in spans).strip()
+
+                # Skip: empty lines, already seen, or too long to be a heading (> 15 words)
+                if not text_line or text_line in already_seen or len(text_line.split()) > 15:
+                    continue
+
+                font_size = spans[0]["size"]  # Use first span's font size as representative
+
+                # Only treat text as heading if font size is large enough (>= 13pt)
+                if font_size >= 13:
+                    # Classify heading level by font size thresholds
+                    if font_size >= 18:
+                        h_level = 1   # Large = H1 (title-level)
+                    elif font_size >= 15:
+                        h_level = 2   # Medium = H2
+                    else:
+                        h_level = 3   # Smaller but still notable = H3
+
+                    found_headings.append({
+                        "level": h_level,
+                        "text": text_line,
+                        "page": page_no
+                    })
+                    already_seen.add(text_line)  # Mark as seen to avoid duplicates
+
+    return found_headings
+
+# ── EMBEDDING GENERATION ───────────────────────────────────────────────────────
+
+@st.cache_data
+# @st.cache_data caches based on INPUT — same sentences = reuse cached embeddings
+# Avoids re-encoding the entire document every time the user types a new query
+def create_embeddings(text_list):
+    model = load_nlp_model()
+    # Encode all sentences into vectors — returns a 2D numpy array
+    # Shape: (num_sentences, 384) — each sentence becomes a 384-number vector
+    return model.encode(list(text_list))
+
+# ── SEMANTIC SEARCH ────────────────────────────────────────────────────────────
+
+def perform_search(user_query, original_sentences, doc_embeddings, top_n):
+    model = load_nlp_model()
+
+    # Encode the user's query into the same vector space as the document sentences
+    query_vec = model.encode([user_query])
+
+    # Compute cosine similarity between query vector and ALL sentence vectors
+    # Result: array of scores between 0 (no match) and 1 (perfect match)
+    scores = cosine_similarity(query_vec, doc_embeddings)[0]
+
+    # argsort returns indices sorted ascending — [::-1] reverses to descending
+    # [:top_n] takes only the top N highest scoring indices
+    best_indices = np.argsort(scores)[::-1][:top_n]
+
+    results_list = []
+    for i, idx in enumerate(best_indices):
+        results_list.append({
+            "rank": i + 1,
+            "confidence": round(float(scores[idx]), 3),  # Similarity score 0–1
+            "text": original_sentences[idx][0],           # The actual sentence text
+            "page": original_sentences[idx][1] if original_sentences[idx][1] else "N/A"
+        })
+    return results_list
+
+# ── STREAMLIT UI ───────────────────────────────────────────────────────────────
+# Everything below builds the web interface — runs top to bottom on every interaction
+
+st.set_page_config(page_title="AI Doc Analyzer")
+st.title("📄 Document Analyzer")
+st.write("Upload a file to summarize, extract structure, or search semantically.")
+
+# File uploader — accepts only PDF and DOCX
+uploaded_file = st.file_uploader("Choose a file", type=["pdf", "docx"])
+
+if uploaded_file is not None:
+    file_data = uploaded_file.read()                          # Read raw bytes
+    extension = uploaded_file.name.split(".")[-1].lower()    # Get file extension
+
+    # Route to the correct parser based on file type
+    if extension == "pdf":
+        raw_text, structure, sentences = get_text_from_pdf(file_data)
+        is_pdf = True
+    else:
+        raw_text, structure, sentences = get_text_from_docx(file_data)
+        is_pdf = False
+
+    # Show confirmation with sentence count
+    st.info(f"File loaded: {uploaded_file.name} ({len(sentences)} sentences found)")
+
+    # Radio buttons let user pick which feature to use
+    task = st.radio("Choose a Task:", ["Summarize", "View Headings", "Search Inside"])
+    st.divider()
+
+    # ── TASK: SUMMARIZE ────────────────────────────────────────────────────────
+    if task == "Summarize":
+        st.subheader("Extractive Summary")
+        with st.spinner("Processing text..."):  # Shows loading spinner while running
+            summary_text, total, kept = run_summarizer(raw_text)
+            st.write(summary_text)
+            st.caption(f"Note: Kept {kept} sentences from a total of {total}.")
+
+    # ── TASK: VIEW HEADINGS ────────────────────────────────────────────────────
+    elif task == "View Headings":
+        st.subheader("Document Index")
+
+        # PDFs: detect headings by font size | DOCX: use Word heading styles
+        if is_pdf:
+            results = find_pdf_headings(structure)
+        else:
+            results = [{"level": h["level"], "text": h["text"], "page": "—"} for h in structure]
+
+        if not results:
+            st.warning("No headings detected ")
+        else:
+            for item in results:
+                # Indent headings visually based on level (H2 indented more than H1, etc.)
+                space = "    " * (item["level"] - 1)
+                st.markdown(f"{space}**L{item['level']}**: {item['text']} (p. {item['page']})")
+
+    # ── TASK: SEMANTIC SEARCH ──────────────────────────────────────────────────
+    elif task == "Search Inside":
+        st.subheader("Semantic Search")
+        user_input = st.text_input("What are you looking for?")
+        how_many = st.slider("Number of results", 1, 10, 3)  # Default: 3 results
+
+        if user_input:
+            with st.spinner("Finding best matches..."):
+                just_text = [s[0] for s in sentences]  # Extract just the text, drop page numbers
+
+                # Convert to tuple for @st.cache_data — lists aren't hashable for caching
+                embeddings = create_embeddings(tuple(just_text))
+
+                search_results = perform_search(user_input, sentences, embeddings, how_many)
+
+                for res in search_results:
+                    st.write(f"**Result #{res['rank']}** (Score: {res['confidence']}) - Page: {res['page']}")
+                    st.write(res['text'])
+                    st.markdown("---")  # Visual separator between results
